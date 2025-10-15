@@ -1,39 +1,43 @@
-# Step 1: Mount Google Drive and set dataset paths
+# ----------------- STEP 0: SETUP -----------------
 from google.colab import drive
 import os
 drive.mount('/content/drive')
 
-# Change this path to point to your uploaded dataset location
-dataset_root = "/content/drive/MyDrive/Snoring Dataset"
+dataset_root = "/content/drive/MyDrive/DSP_OEA/extracted/Snoring Dataset"
 snore_folder = os.path.join(dataset_root, '1')           # Snoring audios
 non_snore_folder = os.path.join(dataset_root, '0')       # Non-snoring audio
 
 print(f"Snoring files count: {len(os.listdir(snore_folder))}")
 print(f"Non-snoring files count: {len(os.listdir(non_snore_folder))}")
 
-# Step 2: Import required libraries
+# ----------------- STEP 1: IMPORT LIBRARIES -----------------
 import librosa
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, find_peaks
+from scipy.signal import butter, filtfilt, find_peaks, hilbert, stft, welch, lfilter, resample
+import pywt
 import pandas as pd
 
-# Step 3: Define DSP Functions
-def bandpass_filter(signal, lowcut, highcut, fs, order=4):
-    nyquist = 0.5 * fs
-    b, a = butter(order, [lowcut/nyquist, highcut/nyquist], btype='band')
-    return filtfilt(b, a, signal)
+# ----------------- STEP 2: DSP FUNCTIONS -----------------
+def bandpass_filter(signal_in, lowcut, highcut, fs, order=4):
+    nyq = 0.5*fs
+    b,a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
+    # Use filtfilt if signal is long enough
+    padlen = 3*(max(len(a),len(b))-1)
+    if len(signal_in) > padlen:
+        return filtfilt(b,a,signal_in)
+    else:
+        return lfilter(b,a,signal_in)  # fallback for short signals
 
-def adaptive_noise_reduction(signal, window_size=500):
-    # Moving average filter approximation of noise
-    noise_estimate = np.convolve(signal, np.ones(window_size)/window_size, mode='same')
-    return signal - noise_estimate
+def adaptive_noise_reduction(signal_in, window_size=500):
+    noise_estimate = np.convolve(signal_in, np.ones(window_size)/window_size, mode='same')
+    return signal_in - noise_estimate
 
-def extract_features(signal, peaks, sr):
+def extract_features(signal_in, peaks, sr):
     durations = np.diff(peaks)/sr if len(peaks) > 1 else [0]
-    rms = np.sqrt(np.mean(signal**2))
-    zero_crossing_rate = ((signal[:-1]*signal[1:])<0).sum()
-    fft_vals = np.abs(np.fft.rfft(signal))
+    rms = np.sqrt(np.mean(signal_in**2))
+    zero_crossing_rate = ((signal_in[:-1]*signal_in[1:])<0).sum()
+    fft_vals = np.abs(np.fft.rfft(signal_in))
     spectral_energy = np.sum(fft_vals**2)
     num_events = len(peaks)
     return {
@@ -45,29 +49,23 @@ def extract_features(signal, peaks, sr):
         'num_events': num_events
     }
 
-# Step 4: Process one example noisy snoring audio with full DSP & noise reduction
-example_file = os.listdir(snore_folder)[-1]   # pick one from noisy samples at end
+# ----------------- STEP 3: PROCESS ONE EXAMPLE SNORING FILE -----------------
+example_file = os.listdir(snore_folder)[-1]
 file_path = os.path.join(snore_folder, example_file)
 
 y, sr = librosa.load(file_path, sr=None)
 print(f"Loaded '{example_file}' | Sampling rate: {sr}")
 
 plt.figure(figsize=(12,3))
-plt.plot(y)
-plt.title("Original Noisy Snoring Audio")
-plt.show()
+plt.plot(y); plt.title("Original Noisy Snoring Audio"); plt.show()
 
 filtered = bandpass_filter(y, 50, 800, sr)
 plt.figure(figsize=(12,3))
-plt.plot(filtered)
-plt.title("After Bandpass Filter (50-800 Hz)")
-plt.show()
+plt.plot(filtered); plt.title("After Bandpass Filter (50-800 Hz)"); plt.show()
 
 cleaned = adaptive_noise_reduction(filtered, window_size=500)
 plt.figure(figsize=(12,3))
-plt.plot(cleaned)
-plt.title("After Adaptive Noise Reduction (Moving Average Subtraction)")
-plt.show()
+plt.plot(cleaned); plt.title("After Adaptive Noise Reduction"); plt.show()
 
 peaks, _ = find_peaks(cleaned, height=np.mean(cleaned), distance=int(sr*0.5))
 plt.figure(figsize=(12,3))
@@ -79,9 +77,8 @@ plt.show()
 features = extract_features(cleaned, peaks, sr)
 print("Extracted Features:", features)
 
-# Step 5: Process entire Folder1 and Folder0 dataset, extract features and label
+# ----------------- STEP 4: PROCESS FULL DATASET -----------------
 feature_rows = []
-files_processed = []
 
 for folder, label in [(snore_folder, 1), (non_snore_folder, 0)]:
     for f in os.listdir(folder):
@@ -92,49 +89,121 @@ for folder, label in [(snore_folder, 1), (non_snore_folder, 0)]:
             clean = adaptive_noise_reduction(filt)
             peaks, _ = find_peaks(clean, height=np.mean(clean), distance=int(fs*0.5))
             feats = extract_features(clean, peaks, fs)
-            feats["label"] = label
-            feats["filename"] = f
+            feats['label'] = label
+            feats['filename'] = f
             feature_rows.append(feats)
-            files_processed.append(f)
         except Exception as e:
             print(f"Skipping {f} due to error: {e}")
 
 df = pd.DataFrame(feature_rows)
 print("Extracted features dataset shape:", df.shape)
 
-# Step 6: Split data into train/test, train Random Forest classifier
+# ----------------- STEP 5: TRAIN RANDOM FOREST -----------------
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 
-X = df.drop(columns=['filename', 'label'])
+X = df.drop(columns=['filename','label'])
 y = df['label']
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size=0.2,random_state=42)
 clf = RandomForestClassifier(random_state=42)
 clf.fit(X_train, y_train)
 
-# Step 7: Evaluate model
 y_pred = clf.predict(X_test)
-print("Classification Report:\n", classification_report(y_test, y_pred))
+print("Classification Report:\n", classification_report(y_test,y_pred))
 
-cm = confusion_matrix(y_test, y_pred)
+cm = confusion_matrix(y_test,y_pred)
 sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-plt.xlabel('Predicted Label')
-plt.ylabel('True Label')
-plt.title('Confusion Matrix')
-plt.show()
+plt.xlabel('Predicted'); plt.ylabel('True'); plt.title('Confusion Matrix'); plt.show()
 
-# Step 8: Calculate sleep quality score
-df["sleep_quality_score"] = 100 - (df["num_events"] * 10 + df["spectral_energy"] / 1e6)
+df["sleep_quality_score"] = 100 - (df["num_events"]*10 + df["spectral_energy"]/1e6)
+print(df[['filename','sleep_quality_score']].head())
 
-print(df[['filename', 'sleep_quality_score']].head())
-
-# Step 9: Save extracted features and model to Drive
-df.to_csv(os.path.join(dataset_root, "extracted_features_sleep_quality.csv"), index=False)
-
+df.to_csv(os.path.join(dataset_root,"extracted_features_sleep_quality.csv"), index=False)
 import joblib
-joblib.dump(clf, os.path.join(dataset_root, "rf_sleep_model.pkl"))
+joblib.dump(clf, os.path.join(dataset_root,"rf_sleep_model.pkl"))
 
 print("Features and model saved.")
+
+# ----------------- STEP 6 FIXED: BREATHING DSP -----------------
+y_b, sr_b = librosa.load(breathing_file, sr=None)
+if y_b.ndim > 1: y_b = np.mean(y_b, axis=1)
+
+# Downsample safely
+Fs_new = 50
+num_samples = int(len(y_b) * Fs_new / sr_b)
+y_b_resampled = resample(y_b, num_samples)
+t_b = np.arange(len(y_b_resampled)) / Fs_new
+
+# Bandpass 0.1-1 Hz
+y_b_filtered = bandpass_filter(y_b_resampled, 0.1, 1.0, Fs_new)
+
+# Wavelet denoising
+try:
+    y_b_denoised = pywt.threshold(y_b_filtered, np.std(y_b_filtered)/2, mode='soft')
+except:
+    y_b_denoised = y_b_filtered
+
+# ----------------- PSD -----------------
+nperseg_psd = min(2*Fs_new, len(y_b_denoised))  # dynamically adjust
+f_psd, Pxx = welch(y_b_denoised, fs=Fs_new, nperseg=nperseg_psd, window='hamming')
+
+# ----------------- STFT / Spectrogram -----------------
+nperseg_stft = min(2*Fs_new, len(y_b_denoised))
+noverlap_stft = int(0.8 * nperseg_stft)  # must be less than nperseg
+f_stft, t_stft, Zxx = stft(y_b_denoised, fs=Fs_new, nperseg=nperseg_stft,
+                             noverlap=noverlap_stft, nfft=2**int(np.ceil(np.log2(nperseg_stft))))
+P_stft = np.abs(Zxx)**2
+
+# Envelope extraction
+envelope = np.abs(hilbert(y_b_denoised))
+
+import matplotlib.gridspec as gridspec
+
+# ----------------- STEP 7: NEAT BREATHING DSP PLOT -----------------
+plt.figure(figsize=(14,10))
+gs = gridspec.GridSpec(2, 2, height_ratios=[1,1], width_ratios=[1,1], hspace=0.35, wspace=0.3)
+
+# ---------- Top Left: Time-domain processing ----------
+ax0 = plt.subplot(gs[0,:])
+ax0.plot(t_b, y_b_resampled, color=[0.7,0.7,0.7], label='Downsampled', linewidth=0.5)
+ax0.plot(t_b, y_b_filtered, 'g', label='Bandpass', linewidth=1.0)
+ax0.plot(t_b, y_b_denoised, 'b', label='Denoised', linewidth=1.5)
+ax0.set_title("Time Domain Processing")
+ax0.set_xlabel("Time (s)")
+ax0.set_ylabel("Amplitude")
+ax0.legend(loc='upper right')
+ax0.set_xlim([0, t_b[-1]])
+
+# ---------- Bottom Left: PSD ----------
+ax1 = plt.subplot(gs[1,0])
+ax1.plot(f_psd, 10*np.log10(Pxx), color='m')
+ax1.set_xlim([0, 2*1.0])
+ax1.set_title("Power Spectral Density (PSD)")
+ax1.set_xlabel("Frequency (Hz)")
+ax1.set_ylabel("Power (dB/Hz)")
+ax1.grid(True)
+
+# ---------- Bottom Right Top: Spectrogram ----------
+ax2 = plt.subplot(gs[1,1])
+pcm = ax2.pcolormesh(t_stft, f_stft, 10*np.log10(P_stft), shading='gouraud', cmap='jet')
+ax2.set_ylim([0, 2*1.0])
+ax2.set_title("Spectrogram")
+ax2.set_xlabel("Time (s)")
+ax2.set_ylabel("Frequency (Hz)")
+plt.colorbar(pcm, ax=ax2, label='Power (dB)')
+
+# ---------- Bottom Right Bottom: Envelope & Denoised overlay ----------
+fig, ax3 = plt.subplots(figsize=(7,3))
+ax3.plot(t_b, y_b_denoised, 'b', linewidth=0.5, label='Denoised')
+ax3.plot(t_b, envelope, 'r', linewidth=1.5, label='Envelope')
+ax3.set_title("Denoised + Envelope Overlay")
+ax3.set_xlabel("Time (s)")
+ax3.set_ylabel("Amplitude")
+ax3.set_xlim([0, t_b[-1]])
+ax3.legend(loc='upper right')
+
+plt.show()
+print("Breathing DSP Analysis complete.")
