@@ -1,0 +1,140 @@
+# Step 1: Mount Google Drive and set dataset paths
+from google.colab import drive
+import os
+drive.mount('/content/drive')
+
+# Change this path to point to your uploaded dataset location
+dataset_root = "/content/drive/MyDrive/Snoring Dataset"
+snore_folder = os.path.join(dataset_root, '1')           # Snoring audios
+non_snore_folder = os.path.join(dataset_root, '0')       # Non-snoring audio
+
+print(f"Snoring files count: {len(os.listdir(snore_folder))}")
+print(f"Non-snoring files count: {len(os.listdir(non_snore_folder))}")
+
+# Step 2: Import required libraries
+import librosa
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt, find_peaks
+import pandas as pd
+
+# Step 3: Define DSP Functions
+def bandpass_filter(signal, lowcut, highcut, fs, order=4):
+    nyquist = 0.5 * fs
+    b, a = butter(order, [lowcut/nyquist, highcut/nyquist], btype='band')
+    return filtfilt(b, a, signal)
+
+def adaptive_noise_reduction(signal, window_size=500):
+    # Moving average filter approximation of noise
+    noise_estimate = np.convolve(signal, np.ones(window_size)/window_size, mode='same')
+    return signal - noise_estimate
+
+def extract_features(signal, peaks, sr):
+    durations = np.diff(peaks)/sr if len(peaks) > 1 else [0]
+    rms = np.sqrt(np.mean(signal**2))
+    zero_crossing_rate = ((signal[:-1]*signal[1:])<0).sum()
+    fft_vals = np.abs(np.fft.rfft(signal))
+    spectral_energy = np.sum(fft_vals**2)
+    num_events = len(peaks)
+    return {
+        'mean_event_duration': np.mean(durations),
+        'std_event_duration': np.std(durations),
+        'rms': rms,
+        'zero_crossing_rate': zero_crossing_rate,
+        'spectral_energy': spectral_energy,
+        'num_events': num_events
+    }
+
+# Step 4: Process one example noisy snoring audio with full DSP & noise reduction
+example_file = os.listdir(snore_folder)[-1]   # pick one from noisy samples at end
+file_path = os.path.join(snore_folder, example_file)
+
+y, sr = librosa.load(file_path, sr=None)
+print(f"Loaded '{example_file}' | Sampling rate: {sr}")
+
+plt.figure(figsize=(12,3))
+plt.plot(y)
+plt.title("Original Noisy Snoring Audio")
+plt.show()
+
+filtered = bandpass_filter(y, 50, 800, sr)
+plt.figure(figsize=(12,3))
+plt.plot(filtered)
+plt.title("After Bandpass Filter (50-800 Hz)")
+plt.show()
+
+cleaned = adaptive_noise_reduction(filtered, window_size=500)
+plt.figure(figsize=(12,3))
+plt.plot(cleaned)
+plt.title("After Adaptive Noise Reduction (Moving Average Subtraction)")
+plt.show()
+
+peaks, _ = find_peaks(cleaned, height=np.mean(cleaned), distance=int(sr*0.5))
+plt.figure(figsize=(12,3))
+plt.plot(cleaned)
+plt.plot(peaks, cleaned[peaks], 'rx')
+plt.title("Detected Snoring Events (Peaks)")
+plt.show()
+
+features = extract_features(cleaned, peaks, sr)
+print("Extracted Features:", features)
+
+# Step 5: Process entire Folder1 and Folder0 dataset, extract features and label
+feature_rows = []
+files_processed = []
+
+for folder, label in [(snore_folder, 1), (non_snore_folder, 0)]:
+    for f in os.listdir(folder):
+        try:
+            fp = os.path.join(folder,f)
+            sig, fs = librosa.load(fp, sr=None)
+            filt = bandpass_filter(sig, 50, 800, fs)
+            clean = adaptive_noise_reduction(filt)
+            peaks, _ = find_peaks(clean, height=np.mean(clean), distance=int(fs*0.5))
+            feats = extract_features(clean, peaks, fs)
+            feats["label"] = label
+            feats["filename"] = f
+            feature_rows.append(feats)
+            files_processed.append(f)
+        except Exception as e:
+            print(f"Skipping {f} due to error: {e}")
+
+df = pd.DataFrame(feature_rows)
+print("Extracted features dataset shape:", df.shape)
+
+# Step 6: Split data into train/test, train Random Forest classifier
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+
+X = df.drop(columns=['filename', 'label'])
+y = df['label']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+clf = RandomForestClassifier(random_state=42)
+clf.fit(X_train, y_train)
+
+# Step 7: Evaluate model
+y_pred = clf.predict(X_test)
+print("Classification Report:\n", classification_report(y_test, y_pred))
+
+cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix')
+plt.show()
+
+# Step 8: Calculate sleep quality score
+df["sleep_quality_score"] = 100 - (df["num_events"] * 10 + df["spectral_energy"] / 1e6)
+
+print(df[['filename', 'sleep_quality_score']].head())
+
+# Step 9: Save extracted features and model to Drive
+df.to_csv(os.path.join(dataset_root, "extracted_features_sleep_quality.csv"), index=False)
+
+import joblib
+joblib.dump(clf, os.path.join(dataset_root, "rf_sleep_model.pkl"))
+
+print("Features and model saved.")
